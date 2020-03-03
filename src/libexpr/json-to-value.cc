@@ -1,178 +1,112 @@
 #include "json-to-value.hh"
 #include <nlohmann/json.hpp>
-
-using json = nlohmann::json;
-#if HAVE_BOEHMGC
-#define GC_NEW_ABORTS_ON_OOM
-#include <gc/gc_cpp.h>
-#include <gc/gc.h>
-template<class T> struct GCDeleter {
-    GCDeleter<T>() {};
-    void operator()(T* p) const {
-        std::destroy_at<T>(p);
-        GC_FREE(p);
-    };
-};
-#define NOGC_NEW new(NoGC)
-#else
-#define NOGC_NEW new
-#endif
+#include "simdjson.cpp"
+#include <chrono>
+#include <ratio>
 
 namespace nix {
-// for more information, refer to
-// https://github.com/nlohmann/json/blob/master/include/nlohmann/detail/input/json_sax.hpp
-class JSONSax : nlohmann::json_sax<json> {
-    class JSONState {
-    public:
-#if HAVE_BOEHMGC
-        typedef std::unique_ptr<JSONState, GCDeleter<JSONState>> u_ptr;
-#else
-        typedef std::unique_ptr<JSONState> u_ptr;
-#endif
-    protected:
-        u_ptr parent;
-        Value * v;
-    public:
-        virtual u_ptr resolve(EvalState &)
-        {
-            throw std::logic_error("tried to close toplevel json parser state");
-        };
-        explicit JSONState(u_ptr&& p) : parent(std::move(p)), v(nullptr) {};
-        explicit JSONState(Value* v) : v(v) {};
-        JSONState(JSONState& p) = delete;
-        Value& value(EvalState & state)
-        {
-            if (v == nullptr)
-                v = state.allocValue();
-            return *v;
-        };
-        virtual ~JSONState() {};
-        virtual void add() {};
-    };
-
-    class JSONObjectState : public JSONState {
-        using JSONState::JSONState;
-        ValueMap attrs = ValueMap();
-        virtual u_ptr resolve(EvalState & state) override
-        {
-            Value& v = parent->value(state);
-            state.mkAttrs(v, attrs.size());
-            for (auto & i : attrs)
-                v.attrs->push_back(Attr(i.first, i.second));
-            return std::move(parent);
+struct SymbolCache {
+    // optimization: json documents often contain duplicate keys at the same level
+    std::vector<std::unordered_map<std::string_view,Symbol>> symbol_caches;
+    inline bool get(unsigned int level) {
+        // do not use the cache on the first time we hit a level
+        // since keys are not (usually) duplicate
+        if (symbol_caches.size() <= level) {
+            symbol_caches.resize(level+1);
+            return false;
+        } else {
+            return true;
         }
-        virtual void add() override { v = nullptr; };
-    public:
-        void key(string_t& name, EvalState & state)
-        {
-            attrs[state.symbols.create(name)] = &value(state);
+    }
+
+    inline Symbol& hit(unsigned int level, EvalState & state, std::string_view& key) {
+        if (symbol_caches.size() <= level) symbol_caches.resize(level+1);
+        auto& tcache = symbol_caches[level];
+        auto it = tcache.find(key);
+        if (it == tcache.end()) {
+            std::string name(key);
+            it = tcache.emplace(key, state.symbols.create(std::move(name))).first;
         }
-    };
-
-    class JSONListState : public JSONState {
-        ValueVector values = ValueVector();
-        virtual u_ptr resolve(EvalState & state) override
-        {
-            Value& v = parent->value(state);
-            state.mkList(v, values.size());
-            for (size_t n = 0; n < values.size(); ++n) {
-                v.listElems()[n] = values[n];
-            }
-            return std::move(parent);
-        }
-        virtual void add() override {
-            values.push_back(v);
-            v = nullptr;
-        };
-    public:
-        JSONListState(u_ptr&& p, std::size_t reserve) : JSONState(std::move(p))
-        {
-            values.reserve(reserve);
-        }
-    };
-
-    EvalState & state;
-    JSONState::u_ptr rs;
-
-    template<typename T, typename... Args> inline bool handle_value(T f, Args... args)
-    {
-        f(rs->value(state), args...);
-        rs->add();
-        return true;
-    }
-
-public:
-    JSONSax(EvalState & state, Value & v) : state(state), rs(NOGC_NEW JSONState(&v)) {};
-
-    bool null()
-    {
-        return handle_value(mkNull);
-    }
-
-    bool boolean(bool val)
-    {
-        return handle_value(mkBool, val);
-    }
-
-    bool number_integer(number_integer_t val)
-    {
-        return handle_value(mkInt, val);
-    }
-
-    bool number_unsigned(number_unsigned_t val)
-    {
-        return handle_value(mkInt, val);
-    }
-
-    bool number_float(number_float_t val, const string_t& s)
-    {
-        return handle_value(mkFloat, val);
-    }
-
-    bool string(string_t& val)
-    {
-        return handle_value<void(Value&, const char*)>(mkString, val.c_str());
-    }
-
-    bool start_object(std::size_t len)
-    {
-        rs = JSONState::u_ptr(NOGC_NEW JSONObjectState(std::move(rs)));
-        return true;
-    }
-
-    bool key(string_t& name)
-    {
-        dynamic_cast<JSONObjectState*>(rs.get())->key(name, state);
-        return true;
-    }
-
-    bool end_object() {
-        rs = rs->resolve(state);
-        rs->add();
-        return true;
-    }
-
-    bool end_array() {
-        return end_object();
-    }
-
-    bool start_array(size_t len) {
-        rs = JSONState::u_ptr(NOGC_NEW JSONListState(std::move(rs),
-                len != std::numeric_limits<size_t>::max() ? len : 128));
-        return true;
-    }
-
-    bool parse_error(std::size_t, const std::string&, const nlohmann::detail::exception& ex) {
-        throw JSONParseError(ex.what());
+        return (*it).second;
     }
 };
+
+void parse_json(SymbolCache& cache, EvalState & state, document::parser::Iterator &pjh, Value & v) {
+    switch(pjh.get_type()) { // values: {["slutfnd
+    case '{': {
+        ValueMap attrs = ValueMap();
+        if (pjh.down()) {
+            bool use_cache = cache.get(pjh.get_depth());
+            do {
+                // pjh is now string
+                std::string_view key(pjh.get_string(), pjh.get_string_length());
+                Value& v2 = *state.allocValue();
+                if (use_cache) {
+                    attrs[cache.hit(pjh.get_depth(), state, key)] = &v2;
+                } else {
+                    attrs[state.symbols.create(std::move(std::string(key)))] = &v2;
+                }
+                pjh.move_to_value();
+                parse_json(cache, state, pjh, v2);
+            } while (pjh.next());
+            pjh.up();
+        }
+        state.mkAttrs(v, attrs.size());
+        for (auto & i : attrs)
+            v.attrs->push_back(Attr(i.first, i.second));
+    }; break;
+    case '[': {
+        ValueVector values = ValueVector();
+        if (pjh.down()) {
+            do {
+                Value& v2 = *state.allocValue();
+                values.push_back(&v2);
+                parse_json(cache, state, pjh, v2);
+            } while (pjh.next());
+            pjh.up();
+        }
+        state.mkList(v, values.size());
+        for (size_t n = 0; n < values.size(); ++n) {
+            v.listElems()[n] = values[n];
+        }
+    }; break;
+    case '"': {
+        // todo: handle null byte
+        mkStringNoCopy(v, pjh.get_string());
+    }; break;
+    case 's': case 'l': case 'u':
+        mkInt(v, pjh.get_integer()); break;
+    case 't': case 'f': mkBool(v, pjh.is_true()); break;
+    case 'n': mkNull(v); break;
+    case 'd': mkFloat(v, pjh.get_double()); break;
+    }
+}
 
 void parseJSON(EvalState & state, const string & s_, Value & v)
 {
-    JSONSax parser(state, v);
-    bool res = json::sax_parse(s_, &parser);
-    if (!res)
-        throw JSONParseError("Invalid JSON Value");
+    using namespace std::chrono;
+    //high_resolution_clock::time_point t1 = high_resolution_clock::now();
+    document::parser parser;
+    // todo: check success
+    parser.allocate_capacity(s_.length());
+    // ugly hack: GC buffer the string_buf so we only allocate once
+    // todo: avoid other allocation in allocate_capacity
+    parser.doc.string_buf.reset((unsigned char*)GC_malloc_atomic(ROUNDUP_N(5 * s_.length() / 3 + 32, 64)));
+    auto [doc, error] = parser.parse(s_);
+    if (error) {
+        throw JSONParseError(error_message(error));
+    }
+    auto iterator = document::iterator(doc);
+    //high_resolution_clock::time_point t2 = high_resolution_clock::now();
+    SymbolCache symbol_cache;
+    parse_json(symbol_cache, state, iterator, v);
+    // todo: realloc to current_string_buf_loc - string_buf bytes
+    parser.doc.string_buf.release();
+    //high_resolution_clock::time_point t3 = high_resolution_clock::now();
+    //duration<double> time_span = duration_cast<duration<double>>(t2 - t1);
+    //duration<double> time_span2 = duration_cast<duration<double>>(t3 - t2);
+    //std::cerr << "Parse: " << time_span.count() << " seconds." << std::endl;
+    //std::cerr << "Process: " << time_span2.count() << " seconds." << std::endl;
 }
 
 }

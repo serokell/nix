@@ -68,6 +68,11 @@ private:
     Symbols symbols;
 
 public:
+    Symbol create(const string && s)
+    {
+        std::pair<Symbols::iterator, bool> res = symbols.insert(std::move(s));
+        return Symbol(&*res.first);
+    }
     Symbol create(const string & s)
     {
         std::pair<Symbols::iterator, bool> res = symbols.insert(s);
