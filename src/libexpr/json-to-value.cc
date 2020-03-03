@@ -5,55 +5,24 @@
 #include <ratio>
 
 namespace nix {
-struct SymbolCache {
-    // optimization: json documents often contain duplicate keys at the same level
-    std::vector<std::unordered_map<std::string_view,Symbol>> symbol_caches;
-    inline bool get(unsigned int level) {
-        // do not use the cache on the first time we hit a level
-        // since keys are not (usually) duplicate
-        if (symbol_caches.size() <= level) {
-            symbol_caches.resize(level+1);
-            return false;
-        } else {
-            return true;
-        }
-    }
 
-    inline Symbol& hit(unsigned int level, EvalState & state, std::string_view& key) {
-        if (symbol_caches.size() <= level) symbol_caches.resize(level+1);
-        auto& tcache = symbol_caches[level];
-        auto it = tcache.find(key);
-        if (it == tcache.end()) {
-            std::string name(key);
-            it = tcache.emplace(key, state.symbols.create(std::move(name))).first;
-        }
-        return (*it).second;
-    }
-};
-
-void parse_json(SymbolCache& cache, EvalState & state, document::parser::Iterator &pjh, Value & v) {
+void parse_json(EvalState & state, document::parser::Iterator &pjh, Value & v) {
     switch(pjh.get_type()) { // values: {["slutfnd
     case '{': {
         ValueMap attrs = ValueMap();
         if (pjh.down()) {
-            bool use_cache = cache.get(pjh.get_depth());
             do {
                 // pjh is now string
-                std::string_view key(pjh.get_string(), pjh.get_string_length());
                 Value& v2 = *state.allocValue();
-                if (use_cache) {
-                    attrs[cache.hit(pjh.get_depth(), state, key)] = &v2;
-                } else {
-                    attrs[state.symbols.create(std::move(std::string(key)))] = &v2;
-                }
+                attrs[state.symbols.create(std::move(std::string(pjh.get_string(), pjh.get_string_length())))] = &v2;
                 pjh.move_to_value();
-                parse_json(cache, state, pjh, v2);
+                parse_json(state, pjh, v2);
             } while (pjh.next());
             pjh.up();
         }
         state.mkAttrs(v, attrs.size());
         for (auto & i : attrs)
-            v.attrs->push_back(Attr(i.first, i.second));
+            v.attrs->push_back(std::move(Attr(i.first, i.second)));
     }; break;
     case '[': {
         ValueVector values = ValueVector();
@@ -61,7 +30,7 @@ void parse_json(SymbolCache& cache, EvalState & state, document::parser::Iterato
             do {
                 Value& v2 = *state.allocValue();
                 values.push_back(&v2);
-                parse_json(cache, state, pjh, v2);
+                parse_json(state, pjh, v2);
             } while (pjh.next());
             pjh.up();
         }

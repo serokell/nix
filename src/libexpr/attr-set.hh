@@ -50,6 +50,12 @@ public:
 
     typedef Attr * iterator;
 
+    inline void push_back(const Attr && attr)
+    {
+        assert(size_ < capacity_);
+        attrs[size_++] = std::move(attr);
+    }
+
     void push_back(const Attr & attr)
     {
         assert(size_ < capacity_);
