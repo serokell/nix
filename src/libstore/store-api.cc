@@ -610,10 +610,13 @@ void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
 void copyPaths(ref<Store> srcStore, ref<Store> dstStore, const StorePathSet & storePaths,
     RepairFlag repair, CheckSigsFlag checkSigs, SubstituteFlag substitute)
 {
-    auto valid = dstStore->queryValidPaths(storePaths, substitute);
+
+    StorePathSet closure;
+    srcStore->computeFSClosure(storePaths, closure, false, false);
+    auto valid = dstStore->queryValidPaths(closure, substitute);
 
     PathSet missing;
-    for (auto & path : storePaths)
+    for (auto & path : closure)
         if (!valid.count(path)) missing.insert(srcStore->printStorePath(path));
 
     if (missing.empty()) return;
@@ -635,7 +638,7 @@ void copyPaths(ref<Store> srcStore, ref<Store> dstStore, const StorePathSet & st
         PathSet(missing.begin(), missing.end()),
 
         [&](const Path & storePath) {
-            if (dstStore->isValidPath(dstStore->parseStorePath(storePath))) {
+            if (!missing.count(storePath)) {
                 nrDone++;
                 showProgress();
                 return PathSet();
@@ -654,7 +657,7 @@ void copyPaths(ref<Store> srcStore, ref<Store> dstStore, const StorePathSet & st
 
             auto storePath = dstStore->parseStorePath(storePathS);
 
-            if (!dstStore->isValidPath(storePath)) {
+            if (missing.count(storePathS)) {
                 MaintainCount<decltype(nrRunning)> mc(nrRunning);
                 showProgress();
                 try {
@@ -674,15 +677,6 @@ void copyPaths(ref<Store> srcStore, ref<Store> dstStore, const StorePathSet & st
         });
 }
 
-
-void copyClosure(ref<Store> srcStore, ref<Store> dstStore,
-    const StorePathSet & storePaths, RepairFlag repair, CheckSigsFlag checkSigs,
-    SubstituteFlag substitute)
-{
-    StorePathSet closure;
-    srcStore->computeFSClosure(storePaths, closure);
-    copyPaths(srcStore, dstStore, closure, repair, checkSigs, substitute);
-}
 
 
 ValidPathInfo::ValidPathInfo(const ValidPathInfo & other)
