@@ -5,6 +5,7 @@
 #include "worker-protocol.hh"
 #include "fs-accessor.hh"
 #include "istringstream_nocopy.hh"
+#include <immintrin.h>
 
 namespace nix {
 
@@ -212,9 +213,114 @@ Derivation Store::derivationFromPath(const StorePath & drvPath)
     }
 }
 
+#if defined(__x86_64__)
+__attribute__ ((__target__("avx2")))
+inline static __m256i identify_special(__m256i bytes) {
+    // '\"\\\n\r\t'
+    // low:   0, 0, 1, 0, 0, 0, 0, 0, 0, 16, 4, 0, 2, 8, 0, 0
+    // high: 28, 0, 1, 0, 0, 2, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0
+    const __m256i low_mask = _mm256_set1_epi8(0xf);
+    __m256i lookup_low = _mm256_setr_epi8(0, 0, 1, 0, 0, 0, 0, 0, 0, 16, 4, 0, 2, 8, 0, 0,
+                                          0, 0, 1, 0, 0, 0, 0, 0, 0, 16, 4, 0, 2, 8, 0, 0);
+    __m256i lookup_high = _mm256_setr_epi8(28, 0, 1, 0, 0, 2, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0,
+                                           28, 0, 1, 0, 0, 2, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0);
+    __m256i low = _mm256_shuffle_epi8(lookup_low, bytes);
+    __m256i shifted = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), low_mask);
+    __m256i high = _mm256_shuffle_epi8(lookup_high, shifted);
+    return _mm256_and_si256(high, low);
+}
 
-static void printString(string & res, std::string_view s)
+__attribute__ ((__target__("avx2")))
+inline static __m256i replace_chrs(__m256i bytes, __m256i spec) {
+    const __m256i low_mask = _mm256_set1_epi8(0xf);
+    __m256i lookup_spec = _mm256_setr_epi8(0, '\n' ^ 'n', '\r' ^ 'r', 0, '\t' ^ 't', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                           0, '\n' ^ 'n', '\r' ^ 'r', 0, '\t' ^ 't', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    __m256i shifted_spec = _mm256_and_si256(_mm256_srli_epi16(spec, 2), low_mask);
+    __m256i replacements = _mm256_shuffle_epi8(lookup_spec, shifted_spec);
+    return _mm256_xor_si256(replacements, bytes);
+}
+
+__attribute__ ((__target__("avx2")))
+inline static void insert_backslashes(char *&p, uint32_t mask, __m256i bytes, uint8_t count) {
+    // assumes unescaped data is already written at 'p'
+    if (mask == 0) {
+        p += count;
+        return;
+    }
+    char bbuf[32];
+    _mm256_storeu_si256((__m256i*)bbuf, bytes);
+    uint8_t n = 0; // n: source index
+    uint8_t bit;
+    {
+        bit = __builtin_ctz(mask);
+        mask &= mask - 1;
+        p += bit - n;
+        n = bit;
+        *p++ = '\\';
+    }
+    while(mask) {
+        uint8_t bit = __builtin_ctz(mask);
+        mask &= mask - 1;
+        memcpy(p, &(bbuf[n]), bit - n);
+        p += bit - n;
+        n = bit;
+        *p++ = '\\';
+    }
+    memcpy(p, &(bbuf[n]), count - n);
+    p += count - n;
+}
+
+__attribute__ ((__target__("avx2")))
+static void printString_avx2(string & res, std::string_view s)
 {
+    char buf[(s.size() + 32) * 2 + 2];
+    char * p = buf;
+    *p++ = '"';
+    size_t length = s.length();
+    size_t i = 0;
+    while (i + 32 <= length) {
+        __m256i bytes = _mm256_loadu_si256((__m256i*)&(s[i]));
+        __m256i spec = identify_special(bytes);
+        _mm256_storeu_si256((__m256i*)p, bytes);
+        uint32_t mask = ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(spec, _mm256_set1_epi8(0)));
+        if (mask == 0) {
+            p += 32;
+        } else {
+            bytes = replace_chrs(bytes, spec);
+            insert_backslashes(p, mask, bytes, 32);
+        }
+        i += 32;
+    }
+
+    __m256i bytes = _mm256_loadu_si256((__m256i*)&(s[i]));
+    __m256i spec = identify_special(bytes);
+    uint64_t mask = ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(spec, _mm256_set1_epi8(0)));
+    mask &= (uint64_t)0xFFFFFFFF >> (32 - (length - i));
+    _mm256_storeu_si256((__m256i*)p, bytes);
+    if (mask == 0) {
+        p += length - i;
+    } else {
+        bytes = replace_chrs(bytes, spec);
+        insert_backslashes(p, mask, bytes, length - i);
+    }
+    *p++ = '"';
+    res.append(buf, p - buf);
+}
+static void printString_native(string & res, std::string_view s);
+extern "C" auto printString_resolve() {
+    // detect avx2
+    uint32_t out;
+    asm("cpuid" : "=b"(out):"a"(7), "c"(0):"%edx");
+    if (out & 32) return printString_avx2;
+    return printString_native;
+}
+static void printString(string & res, std::string_view s)
+__attribute__((ifunc("printString_resolve")));
+static void printString_native(string & res, std::string_view s) {
+#else
+static void printString(string & res, std::string_view s) {
+#endif // defined(__x86_64__)
     char buf[s.size() * 2 + 2];
     char * p = buf;
     *p++ = '"';
