@@ -2106,8 +2106,8 @@ Strings EvalSettings::getDefaultNixPath()
     Strings res;
     auto add = [&](const Path & p) { if (pathExists(p)) { res.push_back(p); } };
     add(getHome() + "/.nix-defexpr/channels");
-    add("nixpkgs=" + settings.nixStateDir + "/nix/profiles/per-user/root/channels/nixpkgs");
-    add(settings.nixStateDir + "/nix/profiles/per-user/root/channels");
+    add("nixpkgs=" + settings.nixStateDir + "/profiles/per-user/root/channels/nixpkgs");
+    add(settings.nixStateDir + "/profiles/per-user/root/channels");
     return res;
 }
 
